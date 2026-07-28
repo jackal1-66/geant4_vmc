@@ -15,7 +15,6 @@
 
 cmake_minimum_required(VERSION 3.16...3.27)
 
-
 if(VMC_WITH_Multi)
 add_subdirectory(E03c)
 else()
@@ -26,12 +25,12 @@ add_subdirectory(E03d)
 endif()
 
 #----------------------------------------------------------------------------
-# E03b example requires ROOT version >= 6.13/04
+# E03d example requires ROOT version >= 6.38/00
 #
-#find_package(ROOT QUIET)
-#message(STATUS "Root version ${ROOT_FOUND_VERSION}")
-#if (${ROOT_FOUND_VERSION} GREATER "61302" )
-#  add_subdirectory(E03b)
-#else()
-#  message(STATUS "VMC Examples: E03b example disabled")
-#endif()
+find_package(ROOT QUIET)
+message(STATUS "Root version ${ROOT_FOUND_VERSION}")
+if (ROOT_VERSION VERSION_GREATER "6.38.00")
+  add_subdirectory(E03d)
+else()
+  message(STATUS "VMC Examples: E03d example disabled")
+endif()
