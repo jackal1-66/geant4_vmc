@@ -13,6 +13,9 @@
 /// \author I. Hrivnacova; IPN, Orsay
 
 #include "TG4StepManager.h"
+#include <cctype>
+#include <cstdlib>
+#include <vector>
 #include "TG4G3Units.h"
 #include "TG4GeometryServices.h"
 #include "TG4Globals.h"
@@ -165,6 +168,72 @@ const G4VTouchable* TG4StepManager::GetCurrentTouchable() const
   else
     return fTrack->GetNextTouchable();
 }
+
+//_____________________________________________________________________________
+namespace {
+
+/// Split a VGM assembly-composite physical volume name into its components.
+///
+/// VGM does not import TGeo assemblies as volumes -- Geant4 has no navigable
+/// equivalent of a TGeo assembly, so RootGM::Factory places the first
+/// non-assembly descendant directly into the first non-assembly ancestor
+/// The assembly chain that was collapsed is preserved in the name instead, e.g.
+///
+///   &ITSULayer0_1%ITSUHalfBarrel0_0%ITSUStave0_1%ITSUChip0_3
+///
+/// i.e. '&' marks a composite, '%' separates components, outermost first, and
+/// each collapsed assembly node carries its copy number as a "_<digits>"
+/// suffix. The final component is the volume actually placed in Geant4, whose
+/// copy number is the one of the G4 physical volume.
+///
+/// Without this, CurrentVolOffID() sees one level where TGeo navigation sees
+/// many.
+///
+/// Returns false when the name is not a composite, which is the common case.
+G4bool SplitAssemblyName(
+  const G4String& name, std::vector<G4String>& components)
+{
+  if (name.empty() || name[0] != '&') return false;
+
+  components.clear();
+  std::size_t start = 1; // skip '&'
+  while (start <= name.size()) {
+    const std::size_t sep = name.find('%', start);
+    if (sep == G4String::npos) {
+      components.push_back(name.substr(start));
+      break;
+    }
+    components.push_back(name.substr(start, sep - start));
+    start = sep + 1;
+  }
+  return components.size() > 1;
+}
+
+/// Copy number encoded in a collapsed assembly component ("ITSUStave0_1" -> 1).
+/// Returns false when the component carries no "_<digits>" suffix
+G4bool AssemblyComponentCopyNo(const G4String& component, G4int& copyNo)
+{
+  const std::size_t us = component.rfind('_');
+  if (us == G4String::npos || us + 1 >= component.size()) return false;
+
+  for (std::size_t i = us + 1; i < component.size(); ++i) {
+    if (!isdigit(static_cast<unsigned char>(component[i]))) return false;
+  }
+  copyNo = std::atoi(component.substr(us + 1).c_str());
+  return true;
+}
+
+/// Volume name encoded in a collapsed assembly component ("ITSUStave0_1" ->
+/// "ITSUStave0"). Returns the component unchanged when it carries no
+/// "_<digits>" suffix, since then there is nothing to strip.
+G4String AssemblyComponentName(const G4String& component)
+{
+  G4int dummy = 0;
+  if (!AssemblyComponentCopyNo(component, dummy)) return component;
+  return component.substr(0, component.rfind('_'));
+}
+
+} // namespace
 
 //_____________________________________________________________________________
 G4VPhysicalVolume* TG4StepManager::GetCurrentOffPhysicalVolume(
@@ -425,6 +494,58 @@ Int_t TG4StepManager::CurrentVolOffID(Int_t off, Int_t& copyNo) const
   /// volume and  fill the copy number of its physical volume
 
   if (off == 0) return CurrentVolID(copyNo);
+
+  // Walk the touchable treating a VGM assembly-composite volume as its several
+  // levels, so that "off" means the same thing here as it does
+  // under TGeo navigation. See SplitAssemblyName() above
+  {
+    const G4VTouchable* touchable = GetCurrentTouchable();
+    G4int remaining = off;
+    G4bool sawComposite = false;
+    std::vector<G4String> components;
+    for (G4int level = 0; level <= touchable->GetHistoryDepth(); ++level) {
+      G4VPhysicalVolume* pv = touchable->GetVolume(level);
+      if (pv == nullptr) break;
+
+      // Levels of the physical volume
+      G4int levelsHere = 1;
+      if (SplitAssemblyName(pv->GetName(), components)) {
+        levelsHere = static_cast<G4int>(components.size());
+        sawComposite = true;
+      }
+
+      if (remaining < levelsHere) {
+        if (levelsHere == 1) {
+          if (!sawComposite) {
+            break; // no composite crossed: "off" is still a G4 level offset,
+                   // so the original handling below gives the same answer
+          }
+          // A composite was crossed on the way out, so "off" and the G4 level
+          // index have diverged and the original handling would look one or
+          // more levels too high. This volume is the level asked for.
+          copyNo = pv->GetCopyNo() + fCopyNoOffset;
+          return TG4SDServices::Instance()->GetVolumeID(pv->GetLogicalVolume());
+        }
+        // Inside a collapsed assembly chain. The last component is the volume
+        // Geant4 actually placed; earlier components are the collapsed nodes,
+        // outermost first, so index backwards from the end.
+        const std::size_t idx = components.size() - 1 - remaining;
+        G4int parsed = 0;
+        if (idx == components.size() - 1) {
+          copyNo = pv->GetCopyNo() + fCopyNoOffset;
+        }
+        else if (AssemblyComponentCopyNo(components[idx], parsed)) {
+          copyNo = parsed + fCopyNoOffset;
+        }
+        else {
+          copyNo = 0;
+        }
+        return TG4SDServices::Instance()->GetVolumeID(pv->GetLogicalVolume());
+      }
+      remaining -= levelsHere;
+    }
+  }
+
 #ifdef MCDEBUG
   G4VPhysicalVolume* mother = GetCurrentOffPhysicalVolume(off, true);
 #else
@@ -463,6 +584,52 @@ const char* TG4StepManager::CurrentVolOffName(Int_t off) const
   /// Return the off-th mother's physical volume name.
 
   if (off == 0) return CurrentVolName();
+
+  // Same assembly-aware level walk as CurrentVolOffID().
+  // Without this a detector that identifies itself from an ancestor *name*
+  // lands one or more levels too high. Measured on ALICE TRD, which reads
+  // CurrentVolOffName(7) expecting "BTRD<sector>" and instead got "BSEGMO15",
+  // its grandparent, and aborted the run outright.
+  {
+    const G4VTouchable* touchable = GetCurrentTouchable();
+    G4int remaining = off;
+    G4bool sawComposite = false;
+    std::vector<G4String> components;
+    for (G4int level = 0; level <= touchable->GetHistoryDepth(); ++level) {
+      G4VPhysicalVolume* pv = touchable->GetVolume(level);
+      if (pv == nullptr) break;
+
+      G4int levelsHere = 1;
+      if (SplitAssemblyName(pv->GetName(), components)) {
+        levelsHere = static_cast<G4int>(components.size());
+        sawComposite = true;
+      }
+
+      if (remaining < levelsHere) {
+        if (levelsHere == 1) {
+          if (!sawComposite) {
+            break; // no composite crossed: upstream handling is equivalent
+          }
+          fNameBuffer = TG4GeometryServices::Instance()->UserVolumeName(
+            pv->GetLogicalVolume()->GetName());
+          return fNameBuffer.data();
+        }
+        // Inside a collapsed assembly chain, outermost component first, so
+        // index backwards from the end.
+        const std::size_t idx = components.size() - 1 - remaining;
+        if (idx == components.size() - 1) {
+          fNameBuffer = TG4GeometryServices::Instance()->UserVolumeName(
+            pv->GetLogicalVolume()->GetName());
+        }
+        else {
+          fNameBuffer = TG4GeometryServices::Instance()->UserVolumeName(
+            AssemblyComponentName(components[idx]));
+        }
+        return fNameBuffer.data();
+      }
+      remaining -= levelsHere;
+    }
+  }
 
   G4VPhysicalVolume* mother = GetCurrentOffPhysicalVolume(off);
 
